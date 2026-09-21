@@ -8,7 +8,7 @@ SESSION_TTL_SECONDS = 60 * 60 * 12
 class SessionState:
     session_key: str
     conversation_id: Optional[str] = None
-    model: str = "gpt-5.6-terra"
+    model: str = "gpt-5.6-sol"
     chat_app_ids: List[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_used_at: float = field(default_factory=time.time)
