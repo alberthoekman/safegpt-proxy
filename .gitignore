@@ -25,6 +25,7 @@ pip-wheel-metadata/
 .env
 .env.*
 !.env.example
+config.toml
 
 # Logs
 *.log

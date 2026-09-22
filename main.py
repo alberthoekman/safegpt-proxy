@@ -9,7 +9,7 @@ from app.safegpt_client import SafeGPTClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("proxy")
 
-settings = Settings()
+settings = Settings.load()
 
 app = FastAPI(title="JetBrains OpenAI-Compatible Proxy", version="1.0.0")
 app.include_router(router)
