@@ -116,6 +116,53 @@ In JetBrains AI Assistant:
 4. Keep tool calling enabled if you want SafeGPT tools to be available
 5. Point JetBrains to this proxy instead of calling SafeGPT directly
 
+## Codex setup
+
+Add a provider to `~/.codex/config.toml`:
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "safegpt"
+
+[model_providers.safegpt]
+name = "SafeGPT proxy"
+base_url = "http://localhost:8000/v1"
+wire_api = "responses"
+```
+
+## Cline setup (recommended agent)
+
+Cline uses plain Chat Completions function tools, which the proxy emulates with far fewer workarounds than Codex needs.
+
+1. In Cline, choose the **OpenAI Compatible** provider.
+2. Base URL: `http://localhost:8000/v1`, API key: any value, Model ID: `gpt-5.6-sol`.
+3. Leave tool/function-calling support enabled for the model; without it Cline sends no tools at all.
+4. Use **Act mode** to let it edit files. In Plan mode Cline only offers read-only tools.
+5. Consider disabling Cline skills you don't need: the `skills` tool tells the model to invoke a matching skill before anything else, and SafeGPT's model tends to pick one even when none fits.
+6. Keep file edits on manual approval, at least at first: SafeGPT's model sometimes rewrites a file by deleting and re-adding it.
+
+SafeGPT ignores `reasoning_effort` and the requested model; it always uses its own configured model.
+
+### How tool calls work
+
+SafeGPT has no native function calling (`Message/Execute` only takes `systemMessage` and `prompt`), so the proxy emulates it:
+
+1. Requests that carry client-side tools (`function`, `custom`, `namespace`, `local_shell`, `shell`, `apply_patch`), `instructions`, `previous_response_id` or tool-call history are handled statelessly via `Message/Execute`.
+2. The tool definitions and a strict call protocol are put at the start of the system message; the full transcript, including earlier tool calls and their results, becomes the prompt.
+3. The model answers with `<tool_call name="...">ARGS</tool_call>` blocks, which the proxy turns into real `function_call`, `custom_tool_call`, `local_shell_call`, `shell_call` or `apply_patch_call` output items (streamed as the matching Responses SSE events).
+4. `/chat/completions` gets the same treatment and returns `tool_calls` with `finish_reason: "tool_calls"`.
+5. Function tools whose only parameter is a single string (such as Cline's `apply_patch` with `input`) are offered to the model as freeform tools; the proxy does the JSON encoding, so patches never need escaping.
+
+Hosted OpenAI tools (`web_search`, `file_search`, `code_interpreter`, `mcp`, ...) are ignored. The reply is buffered until SafeGPT finishes, because the proxy has to parse it before sending anything, so tool-path responses arrive all at once rather than token by token.
+
+Agent specifics:
+
+- Newer Codex versions ("responses lite") send no top-level `instructions`/`tools`; tools arrive as an `additional_tools` input item. Both shapes are supported.
+- In Codex "code mode" the only real tool is `exec`, which runs JavaScript that calls the actual tools (`exec_command`, `apply_patch`, ...). SafeGPT's model reliably calls tools directly but writes unusable scripts, so the proxy offers the nested tools directly, wraps each call into a one-line `exec` script, and unwraps those scripts again when replaying history.
+- The model often stops after announcing or planning its next step ("I'll create the files now.", "Plan: 1) ..."), and SafeGPT sometimes returns an empty reply. Whenever a tool-enabled reply has no tool call, the proxy asks SafeGPT once more (up to twice) to either emit the tool call for its next step or answer `FINAL` if it is really done or needs the user. This applies to Codex and Cline alike, and costs one extra call on genuine final answers.
+- Malformed JSON arguments are repaired where possible (unescaped newlines inside strings, trailing text after the object).
+- While SafeGPT is working on a streamed Responses request, `response.in_progress` events are sent every 10 s so Codex's stream idle timeout does not fire.
+
 ## How routing works
 
 ### 1. Model listing

@@ -1,10 +1,11 @@
 import logging
-from fastapi import FastAPI
-import uvicorn
 
-from app.settings import Settings
+import uvicorn
+from fastapi import FastAPI
+
 from app.router import router, set_dependencies
 from app.safegpt_client import SafeGPTClient
+from app.settings import Settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("proxy")
@@ -26,9 +27,16 @@ set_dependencies(
 def healthz():
     return {"ok": True, "service": "jetbrains-openai-compatible-proxy"}
 
+def mask_secret(value: str) -> str:
+    if not value:
+        return "(not set)"
+    return f"***{value[-4:]}" if len(value) > 12 else "***"
+
 @app.on_event("startup")
 def startup_event():
-    logger.info("Starting proxy with settings: %s", settings.model_dump())
+    shown = settings.model_dump()
+    shown["safegpt_token"] = mask_secret(settings.safegpt_token)
+    logger.info("Starting proxy with settings: %s", shown)
 
 @app.on_event("shutdown")
 async def shutdown_event():

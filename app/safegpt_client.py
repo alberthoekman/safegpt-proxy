@@ -1,6 +1,9 @@
 import json
+import logging
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 import httpx
+
+logger = logging.getLogger("proxy.safegpt")
 
 class SafeGPTClient:
     def __init__(self, base_url: str, token: str):
@@ -26,8 +29,13 @@ class SafeGPTClient:
         payload = {"systemMessage": system_message, "prompt": prompt}
         resp = await self.client.post(url, headers=self.headers(), json=payload)
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("content", "")
+        try:
+            data = resp.json()
+        except ValueError:
+            # SafeGPT occasionally answers 200 with a body that is not JSON; treat as empty.
+            logger.warning("SafeGPT Execute returned a non-JSON body: %r", resp.text[:300])
+            return ""
+        return data.get("content") or ""
 
     async def create_conversation(
         self,

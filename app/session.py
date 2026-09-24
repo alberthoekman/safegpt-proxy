@@ -1,6 +1,7 @@
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional
 
 SESSION_TTL_SECONDS = 60 * 60 * 12
 
@@ -32,6 +33,20 @@ def get_or_create_session(session_key: str, model: str, chat_app_ids: List[str])
         state.chat_app_ids = chat_app_ids or state.chat_app_ids
         state.touch()
     return state
+
+# Transcripts (input + output items) of emulated-tool responses, keyed by response id,
+# so clients can chain turns with `previous_response_id` instead of resending history.
+RESPONSE_STORE_MAX = 500
+RESPONSE_STORE: "OrderedDict[str, List[dict]]" = OrderedDict()
+
+def store_response(response_id: str, items: List[dict]):
+    RESPONSE_STORE[response_id] = items
+    RESPONSE_STORE.move_to_end(response_id)
+    while len(RESPONSE_STORE) > RESPONSE_STORE_MAX:
+        RESPONSE_STORE.popitem(last=False)
+
+def load_response(response_id: str) -> Optional[List[dict]]:
+    return RESPONSE_STORE.get(response_id)
 
 def cleanup_sessions():
     cutoff = time.time() - SESSION_TTL_SECONDS
