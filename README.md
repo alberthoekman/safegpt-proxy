@@ -1,3 +1,5 @@
+# moi
+
 # SafeGPT Proxy for JetBrains AI Assistant
 
 This project is a local FastAPI proxy that makes SafeGPT available to JetBrains AI Assistant as an OpenAI-compatible provider.
@@ -53,18 +55,18 @@ safegpt-proxy/
 
 ## Installation
 
-### Using pip
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### Using uv
+The recommended setup is `uv`:
 
 ```bash
 uv sync
+```
+
+If you prefer `pip`, create a virtual environment and install the project in editable mode:
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e .
 ```
 
 ## Configuration

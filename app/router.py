@@ -16,6 +16,7 @@ from app.models import (
     chat_completion_response,
     models_list,
     responses_object,
+    responses_usage,
 )
 from app.safegpt_client import SafeGPTClient, iter_safegpt_sse_lines, parse_safegpt_data
 from app.session import cleanup_sessions, get_or_create_session, load_response, store_response
@@ -30,6 +31,7 @@ web_search_chat_app_id: str = ""
 code_interpreter_chat_app_id: str = ""
 
 def set_dependencies(client: SafeGPTClient, model_id: str, web_id: str, code_id: str):
+    """Inject shared dependencies from the application entry point."""
     global safegpt_client, default_model_id, web_search_chat_app_id, code_interpreter_chat_app_id
     safegpt_client = client
     default_model_id = model_id
@@ -37,11 +39,13 @@ def set_dependencies(client: SafeGPTClient, model_id: str, web_id: str, code_id:
     code_interpreter_chat_app_id = code_id
 
 def normalize_path(path: str) -> str:
+    """Normalize OpenAI-style request paths to their canonical form."""
     if path.startswith("/v1/"):
         return path[3:]
     return path
 
 def message_text(m: Dict[str, Any]) -> str:
+    """Extract a plain text string from a chat message payload."""
     content = m.get("content", "")
     if isinstance(content, str):
         return content
@@ -56,6 +60,7 @@ def message_text(m: Dict[str, Any]) -> str:
     return str(content)
 
 def extract_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract message objects from either chat-completions or Responses payloads."""
     msgs = body.get("messages") or []
     if not msgs:
         raw = body.get("input") or []
@@ -63,6 +68,7 @@ def extract_messages(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     return msgs
 
 def classify_jetbrains_request(body: Dict[str, Any]) -> str:
+    """Classify hidden JetBrains orchestration prompts versus normal chat."""
     messages = extract_messages(body)
     if not messages:
         return "normal_chat"
@@ -81,6 +87,7 @@ def classify_jetbrains_request(body: Dict[str, Any]) -> str:
     return "normal_chat"
 
 def should_use_execute(body: Dict[str, Any]) -> bool:
+    """Return True when the request should route to SafeGPT Execute."""
     return classify_jetbrains_request(body) in {
         "orchestration_title",
         "orchestration_subqueries",
@@ -88,6 +95,7 @@ def should_use_execute(body: Dict[str, Any]) -> bool:
     }
 
 def build_execute_prompt(body: Dict[str, Any]) -> str:
+    """Build the prompt text for a SafeGPT Execute request."""
     messages = extract_messages(body)
     for m in reversed(messages):
         if m.get("role") == "user":
@@ -95,6 +103,7 @@ def build_execute_prompt(body: Dict[str, Any]) -> str:
     return ""
 
 def build_execute_system_message(body: Dict[str, Any]) -> str:
+    """Build the system message for a SafeGPT Execute request."""
     messages = extract_messages(body)
     system_parts = [message_text(m) for m in messages if m.get("role") == "system"]
     return "\n\n".join(system_parts).strip() or "You are a helpful assistant."
@@ -191,7 +200,7 @@ async def stream_responses_events(text_chunks, model: str, include_usage: bool =
         "output_index": 0,
         "item": final_item,
     })
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0} if include_usage else None
+    usage = responses_usage() if include_usage else None
     yield event("response.completed", {
         "response": responses_envelope(model, response_id, "completed", output=[final_item], usage=usage),
     })
@@ -282,6 +291,10 @@ def upstream_error(exc: Exception) -> JSONResponse:
     detail = describe_upstream_error(exc)
     return JSONResponse(status_code=502, content={"error": {"message": detail, "type": "upstream_error", "code": "safegpt_error"}})
 
+async def still_running(task: asyncio.Future) -> bool:
+    """Wait up to KEEPALIVE_SECONDS for `task`; True if it has not finished yet."""
+    return not (await asyncio.wait({task}, timeout=KEEPALIVE_SECONDS))[0]
+
 async def stream_response_items(produce, model: str, response_id: str, on_complete=None):
     """Emit Responses-API SSE events; `produce()` returns the complete output items."""
     seq = [0]
@@ -296,7 +309,7 @@ async def stream_response_items(produce, model: str, response_id: str, on_comple
 
     task = asyncio.ensure_future(produce())
     try:
-        while not (await asyncio.wait({task}, timeout=KEEPALIVE_SECONDS))[0]:
+        while await still_running(task):
             yield event("response.in_progress", {"response": responses_envelope(model, response_id, "in_progress")})
     finally:
         # Client disconnected: stop waiting on SafeGPT.
@@ -339,7 +352,7 @@ async def stream_response_items(produce, model: str, response_id: str, on_comple
         else:
             yield event("response.output_item.added", {"output_index": idx, "item": {**item, "status": "in_progress"}})
         yield event("response.output_item.done", {"output_index": idx, "item": item})
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    usage = responses_usage()
     yield event("response.completed", {"response": responses_envelope(model, response_id, "completed", output=items, usage=usage)})
 
 def chat_message_from_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -353,11 +366,32 @@ def chat_message_from_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         message["tool_calls"] = tool_calls
     return message
 
-async def stream_chat_from_items(items: List[Dict[str, Any]], model: str, include_usage: bool):
+async def stream_chat_items(produce, model: str, include_usage: bool):
+    """Chat Completions SSE; `produce()` returns the complete output items.
+
+    The role chunk goes out immediately and SSE comments keep the connection alive while
+    SafeGPT works, so clients with a first-byte or idle timeout (Cline) keep waiting.
+    """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
-    message = chat_message_from_items(items)
     yield sse_data(chat_completion_chunk(model, chunk_id, created, role="assistant"))
+
+    task = asyncio.ensure_future(produce())
+    try:
+        while await still_running(task):
+            yield ": keep-alive\n\n"
+    finally:
+        # Client disconnected: stop waiting on SafeGPT.
+        if not task.done():
+            task.cancel()
+    try:
+        items = task.result()
+    except Exception as exc:
+        yield sse_data({"error": {"message": describe_upstream_error(exc), "type": "upstream_error", "code": "safegpt_error"}})
+        yield sse_done()
+        return
+
+    message = chat_message_from_items(items)
     if message["content"]:
         yield sse_data(chat_completion_chunk(model, chunk_id, created, content_delta=message["content"]))
     for index, call in enumerate(message.get("tool_calls") or []):
@@ -424,25 +458,39 @@ async def handle_tool_request(body: Dict[str, Any], is_responses: bool):
     async def produce() -> List[Dict[str, Any]]:
         raw_reply = await execute(prompt, "raw reply")
         reply = toolemu.parse_reply(raw_reply)
+        insist = False
         for attempt in range(1, MAX_NUDGES + 1):
             if not toolemu.needs_followup(reply, specs):
                 break
             logger.info("Reply has no tool call; asking the model to act or confirm FINAL (attempt %d)", attempt)
-            nudged = await execute(toolemu.followup_prompt(prompt, reply.text, user_request), "follow-up reply")
+            nudged = await execute(toolemu.followup_prompt(prompt, reply.text, user_request, insist), "follow-up reply")
             if toolemu.is_final_marker(nudged):
-                break
+                # "I'll prepend it..." followed by FINAL: the announced step never happened; ask once more.
+                if insist or not toolemu.announces_next_step(reply.text):
+                    break
+                logger.info("FINAL contradicts a reply that announces a next step; insisting on the tool call")
+                insist = True
+                continue
             retry = toolemu.parse_reply(nudged)
             if retry.calls:
                 reply = toolemu.ParsedReply(text=reply.text, calls=retry.calls)
-            elif not reply.text and retry.text:
+                continue
+            if not reply.text and retry.text:
                 reply = retry
+            # No tool call again ("Done - I added ..." repeated instead of FINAL): the model
+            # stands by its answer, so accept it unless it announces a step still to do.
+            if reply.text and not toolemu.announces_next_step(reply.text):
+                logger.info("Follow-up has no tool call either; keeping the answer as final")
+                break
         output = toolemu.build_output_items(reply, specs, parallel)
         if not output:
             output = toolemu.build_output_items(toolemu.ParsedReply(text=raw_reply.strip() or "(empty response)"), specs, parallel)
         logger.info("Emitting output items: %s", json.dumps([{k: v for k, v in i.items() if k != "content"} for i in output], ensure_ascii=False))
         return output
 
-    if is_responses and stream:
+    if stream:
+        if not is_responses:
+            return StreamingResponse(stream_chat_items(produce, model, include_usage), media_type="text/event-stream")
         response_id = f"resp_{uuid.uuid4().hex}"
         return StreamingResponse(
             stream_response_items(produce, model, response_id, on_complete=lambda out: store_response(response_id, items + out)),
@@ -455,8 +503,6 @@ async def handle_tool_request(body: Dict[str, Any], is_responses: bool):
         return upstream_error(exc)
 
     if not is_responses:
-        if stream:
-            return StreamingResponse(stream_chat_from_items(output, model, include_usage), media_type="text/event-stream")
         response = chat_completion_response(model, "")
         message = chat_message_from_items(output)
         response["choices"][0]["message"] = message
@@ -465,7 +511,7 @@ async def handle_tool_request(body: Dict[str, Any], is_responses: bool):
 
     response_id = f"resp_{uuid.uuid4().hex}"
     store_response(response_id, items + output)
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    usage = responses_usage()
     response = responses_envelope(model, response_id, "completed", output=output, usage=usage)
     response["output_text"] = "\n".join(i["content"][0]["text"] for i in output if i["type"] == "message")
     return JSONResponse(response)
@@ -479,7 +525,7 @@ def get_models():
 @router.get("/healthz")
 @router.get("/v1/healthz")
 def healthz_root():
-    return {"ok": True}
+    return {"ok": True, "service": "jetbrains-openai-compatible-proxy"}
 
 @router.post("/v1/responses")
 @router.post("/responses")
@@ -507,11 +553,14 @@ async def chat_completions(request: Request):
     state.touch()
 
     if should_use_execute(body):
-        content = await safegpt_client.execute(
-            system_message=build_execute_system_message(body),
-            prompt=build_execute_prompt(body),
-            model=model,
-        )
+        try:
+            content = await safegpt_client.execute(
+                system_message=build_execute_system_message(body),
+                prompt=build_execute_prompt(body),
+                model=model,
+            )
+        except httpx.HTTPError as exc:
+            return upstream_error(exc)
         if stream:
             if is_responses:
                 return StreamingResponse(

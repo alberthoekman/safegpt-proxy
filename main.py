@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -12,7 +13,22 @@ logger = logging.getLogger("proxy")
 
 settings = Settings.load()
 
-app = FastAPI(title="JetBrains OpenAI-Compatible Proxy", version="1.0.0")
+def mask_secret(value: str) -> str:
+    """Mask a secret value for safe logging."""
+    if not value:
+        return "(not set)"
+    return f"***{value[-4:]}" if len(value) > 12 else "***"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Log the loaded settings on startup; close the shared SafeGPT HTTP client on shutdown."""
+    shown = settings.model_dump()
+    shown["safegpt_token"] = mask_secret(settings.safegpt_token)
+    logger.info("Starting proxy with settings: %s", shown)
+    yield
+    await safegpt_client.close()
+
+app = FastAPI(title="JetBrains OpenAI-Compatible Proxy", version="1.0.0", lifespan=lifespan)
 app.include_router(router)
 
 safegpt_client = SafeGPTClient(settings.safegpt_base_url, settings.safegpt_token)
@@ -23,24 +39,7 @@ set_dependencies(
     settings.code_interpreter_chat_app_id,
 )
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "service": "jetbrains-openai-compatible-proxy"}
-
-def mask_secret(value: str) -> str:
-    if not value:
-        return "(not set)"
-    return f"***{value[-4:]}" if len(value) > 12 else "***"
-
-@app.on_event("startup")
-def startup_event():
-    shown = settings.model_dump()
-    shown["safegpt_token"] = mask_secret(settings.safegpt_token)
-    logger.info("Starting proxy with settings: %s", shown)
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await safegpt_client.close()
+# /healthz and /v1/healthz are defined in app/router.py.
 
 if __name__ == "__main__":
     uvicorn.run(app, host=settings.host, port=settings.port)

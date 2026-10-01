@@ -293,8 +293,9 @@ def build_tool_protocol(specs: List[ToolSpec], choice: ToolChoice, parallel: boo
         "- Instructions below that mention calling tools, sending commentary or preambles, or tool-call channels all refer to this <tool_call> format.",
         "- Tool results are returned to you in the next turn as [tool result] entries. Never invent or predict tool results.",
         "- When the task is complete and no further tool is needed, answer with plain text and no tool_call blocks.",
-        "- Only use the tools listed below, with the exact names shown.",
-        "- Never delete a file in order to rewrite it; change existing files in place.",
+        "- Only use the tools listed below, with the exact full names shown, including any prefix such as \"server__\".",
+        "- Never delete a file in order to rewrite it; change existing files in place. Deleting a file is fine when the user asks for it.",
+        "- If the request is too vague to act on, ask the user what they mean (use a question tool if one is listed) instead of guessing.",
         "- Keep each tool call small: split large file edits into several smaller edits, one section at a time.",
     ]
     if parallel:
@@ -372,6 +373,39 @@ def content_to_text(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False)
 
 
+# SafeGPT rejects prompts over 10,485,760 characters ("string_above_max_length"). Keep the
+# transcript well under that: the system message (~75 KB for Cline) and follow-ups come on top.
+MAX_TOOL_OUTPUT_CHARS = 200_000
+MAX_TRANSCRIPT_CHARS = 8_000_000
+
+
+def clip_tool_output(name: str, text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Keep the head and tail of an oversized tool result so one huge read cannot sink the request."""
+    if len(text) <= limit:
+        return text
+    keep = limit // 2
+    logger.warning("Tool result from %s is %d chars; keeping the first and last %d", name, len(text), keep)
+    return (
+        f"{text[:keep]}\n\n[... {len(text) - 2 * keep} characters omitted by the proxy: the result was too large. "
+        f"Read a smaller line range or use a narrower search. ...]\n\n{text[-keep:]}"
+    )
+
+
+def fit_turns(turns: List[str], limit: int = MAX_TRANSCRIPT_CHARS) -> List[str]:
+    """Drop the oldest turns after the first (the task) until the transcript fits `limit`."""
+    total = sum(len(t) + 2 for t in turns)
+    if total <= limit:
+        return turns
+    head, rest = turns[:1], turns[1:]
+    dropped = 0
+    while len(rest) > 1 and total > limit:
+        total -= len(rest[0]) + 2
+        rest = rest[1:]
+        dropped += 1
+    logger.warning("Transcript too large for SafeGPT; omitted %d earlier turns", dropped)
+    return head + [f"[... {dropped} earlier turns omitted by the proxy to fit the SafeGPT size limit ...]"] + rest
+
+
 def _render_call(name: str, body: str) -> str:
     return f'<tool_call name="{name}">\n{body}\n</tool_call>'
 
@@ -442,16 +476,18 @@ def render_transcript(items: List[Dict[str, Any]], wrap_params: Optional[Dict[st
                 output = f"status: {item.get('status', '')}\n{item.get('output') or ''}".strip()
             else:
                 output = content_to_text(output)
-            turns.append(f"[tool result: {call_names.get(call_id, 'tool')} (call_id={call_id})]\n{output}")
+            name = call_names.get(call_id, "tool")
+            turns.append(f"[tool result: {name} (call_id={call_id})]\n{clip_tool_output(name, output)}")
         elif itype == "local_shell_call_output":
             call_id = item.get("call_id") or item.get("id", "")
-            turns.append(f"[tool result: local_shell (call_id={call_id})]\n{content_to_text(item.get('output'))}")
+            output = clip_tool_output("local_shell", content_to_text(item.get("output")))
+            turns.append(f"[tool result: local_shell (call_id={call_id})]\n{output}")
         elif itype in ("reasoning", "additional_tools"):
             # Encrypted reasoning is meaningless to SafeGPT; tools go into the system message.
             continue
         else:
             logger.info("Skipping unsupported input item type %r", itype)
-    return system_parts, "\n\n".join(turns)
+    return system_parts, "\n\n".join(fit_turns(turns))
 
 
 def normalize_input(body: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -562,16 +598,38 @@ def needs_followup(reply: ParsedReply, specs: List[ToolSpec]) -> bool:
     return bool(specs) and not reply.calls
 
 
-def followup_prompt(prompt: str, draft: str, user_request: str = "") -> str:
+_NEXT_STEP_RE = re.compile(
+    r"\b(?:I'll|I will|I'm going to|I am going to|I(?:'m| am) \w+ing\b|I need to|I still need|let me(?! know)"
+    r"|next,? I|now I|then (?:I|verify))\b|^\s*plan:",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def announces_next_step(text: str) -> bool:
+    """The draft says the model is about to do something ("I'll prepend ...", "Plan: ...").
+
+    A FINAL answer to the follow-up is then usually wrong: the announced step never happened.
+    """
+    # Models often write typographic apostrophes ("I’ll").
+    return bool(_NEXT_STEP_RE.search((text or "").replace("’", "'")))
+
+
+def followup_prompt(prompt: str, draft: str, user_request: str = "", insist: bool = False) -> str:
     request = f'The user asked: "{user_request.strip()[:500]}"\n' if user_request.strip() else ""
     if not draft:
         return (
             f"{prompt}\n\n[system]\n{request}Your previous reply was empty. Reply now with either the "
             '<tool_call name="..."> block(s) for your next step, or your answer to the user.'
         )
+    insisted = (
+        f"You answered {FINAL_MARKER}, but your reply announces a step that has not been done: no tool call for it "
+        f"appears in the conversation above. {FINAL_MARKER} is not a valid answer now; emit the tool call for that step. "
+        if insist else ""
+    )
     return (
         f"{prompt}\n\n[assistant]\n{draft}\n\n"
         f"[system]\n{request}That reply contains no tool call, so it would end your turn and nothing more would happen. "
+        f"{insisted}"
         "Reply now with only the <tool_call name=\"...\"> block(s) that perform your next step, no other text. "
         "If your reply says you still need to do something (read, edit, run, verify), that step must be a tool call now. "
         f"Reply with exactly {FINAL_MARKER} only if every change the user asked for has already been made in the "
@@ -639,9 +697,30 @@ def _wrapped_args(spec: ToolSpec, body: str) -> str:
     return json.dumps({spec.wrap_param: raw}, ensure_ascii=False)
 
 
-def build_output_items(reply: ParsedReply, specs: List[ToolSpec], parallel: bool) -> List[Dict[str, Any]]:
+def resolve_tool(name: str, specs: List[ToolSpec]) -> Optional[ToolSpec]:
+    """Find the spec for a called tool name, tolerating a dropped MCP prefix or other casing.
+
+    With many MCP tools ("jetbrains-pycharm__search_text") the model often calls the short
+    name ("search_text"), which the client rejects as unknown.
+    """
     by_name = {s.name: s for s in specs}
     by_name.update({s.api_name: s for s in specs if s.api_name not in by_name})
+    if name in by_name:
+        return by_name[name]
+    low = name.lower()
+    for match in (
+        lambda n: n.lower() == low,
+        lambda n: n.lower().endswith(("__" + low, "." + low)),
+    ):
+        found = {id(s): s for n, s in by_name.items() if match(n)}
+        if len(found) == 1:
+            spec = next(iter(found.values()))
+            logger.info("Resolved tool name %r to %r", name, spec.name)
+            return spec
+    return None
+
+
+def build_output_items(reply: ParsedReply, specs: List[ToolSpec], parallel: bool) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     if reply.text:
         items.append({
@@ -653,7 +732,7 @@ def build_output_items(reply: ParsedReply, specs: List[ToolSpec], parallel: bool
         })
     calls = reply.calls if parallel else reply.calls[:1]
     for name, body in calls:
-        spec = by_name.get(name)
+        spec = resolve_tool(name, specs)
         if spec is None:
             logger.warning("Model called unknown tool %r; forwarding as function call", name)
             spec = ToolSpec(name, "function", api_name=name)

@@ -339,6 +339,186 @@ def test_final_answer_confirmed_by_model_is_kept(make_client):
     assert len(fake.calls) == 1 and len(fake.followups) == 1
 
 
+def test_final_after_announced_step_is_challenged(make_client):
+    draft = "I'll prepend `moi` to the README, then verify."
+    call = '<tool_call name="shell">\n{"command": ["dir"]}\n</tool_call>'
+    client, fake = make_client(draft)
+    replies = iter(["FINAL", call])
+
+    async def execute(system_message, prompt, model):
+        if "That reply contains no tool call" in prompt:
+            fake.followups.append(prompt)
+            return next(replies)
+        return draft
+
+    fake.execute = execute
+    out = client.post("/responses", json={"input": "add moi to the readme", "tools": [SHELL_TOOL]}).json()["output"]
+    assert [i["type"] for i in out] == ["message", "function_call"]
+    assert "FINAL is not a valid answer now" not in fake.followups[0]
+    assert "FINAL is not a valid answer now" in fake.followups[1]
+
+
+def test_repeated_done_answer_is_accepted_after_one_followup(make_client):
+    # Live log: the finished task was restated instead of FINAL, costing two extra calls.
+    done = "Done — I added `moi` to the top of `README.md`."
+    client, fake = make_client(done, followup_reply="Done — `moi` was added to the top of `README.md`.")
+    msg = cline_call(client, [{"role": "user", "content": "add 'moi' at the top of the readme"}], [CLINE_APPLY_PATCH])
+    assert msg["content"] == done and "tool_calls" not in msg
+    assert len(fake.followups) == 1
+
+
+def test_claimed_done_without_edit_still_gets_the_call(make_client):
+    # Live log: the model claimed the edit before making it; the follow-up produced the patch.
+    patch = "*** Begin Patch\n*** Update File: README.md\n@@\n+# moi\n+\n # Title\n*** End Patch"
+    client, fake = make_client("I’ve added “moi” at the top of the README.", followup_reply=f'<tool_call name="apply_patch">\n{patch}\n</tool_call>')
+    msg = cline_call(client, [{"role": "user", "content": "add 'moi' at the top of the readme"}], [CLINE_APPLY_PATCH])
+    assert json.loads(msg["tool_calls"][0]["function"]["arguments"]) == {"input": patch}
+    assert len(fake.followups) == 1
+
+
+def test_announced_step_without_call_is_nudged_twice(make_client):
+    client, fake = make_client("I'll edit the README next.", followup_reply="Sure, editing it now.")
+    cline_call(client, [{"role": "user", "content": "edit the readme"}], [CLINE_APPLY_PATCH])
+    assert len(fake.followups) == 2
+
+
+def test_short_mcp_tool_name_is_resolved_to_prefixed_tool(make_client):
+    # Live Cline run: the model called "search_text" for "jetbrains-pycharm__search_text".
+    search_text = {"type": "function", "function": {"name": "jetbrains-pycharm__search_text", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}}
+    client, _ = make_client('<tool_call name="search_text">\n{"q": "hello"}\n</tool_call>')
+    msg = cline_call(client, [{"role": "user", "content": "where is hello used?"}], [search_text, CLINE_RUN_COMMANDS])
+    assert msg["tool_calls"][0]["function"]["name"] == "jetbrains-pycharm__search_text"
+
+
+def test_ambiguous_short_tool_name_is_not_guessed():
+    specs = toolemu.normalize_tools([
+        {"type": "function", "name": "a__search", "parameters": {"type": "object"}},
+        {"type": "function", "name": "b__search", "parameters": {"type": "object"}},
+    ])
+    assert toolemu.resolve_tool("search", specs) is None
+    assert toolemu.resolve_tool("B__SEARCH", specs).name == "b__search"
+
+
+def test_protocol_allows_requested_deletes_and_asks_on_vague_requests():
+    protocol = toolemu.build_tool_protocol(toolemu.normalize_tools([SHELL_TOOL]), toolemu.parse_tool_choice(None), True)
+    assert "Deleting a file is fine when the user asks for it" in protocol
+    assert "instead of guessing" in protocol and "including any prefix" in protocol
+
+
+def test_announces_next_step():
+    assert toolemu.announces_next_step("I'll prepend it now.")
+    assert toolemu.announces_next_step("Done reading.\nPlan:\n1) edit")
+    assert toolemu.announces_next_step("Next, I update the file.")
+    assert not toolemu.announces_next_step("The API is in app.py; run it with `python app.py`.")
+    # Typographic apostrophes and progressive forms from live logs.
+    assert toolemu.announces_next_step("Got it — I’ll limit the inspection to this folder and continue.")
+    assert toolemu.announces_next_step("I’m locating the existing helpers so I can generalize this.")
+    assert not toolemu.announces_next_step("Added the test. Let me know if you want more cases.")
+
+
+def test_huge_tool_result_is_clipped():
+    huge = "A" * 300_000 + "MIDDLE" + "Z" * 300_000
+    items = [
+        {"type": "message", "role": "user", "content": "read uv.lock"},
+        {"type": "function_call", "call_id": "c1", "name": "read_files", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": huge},
+    ]
+    _, transcript = toolemu.render_transcript(items)
+    assert len(transcript) < toolemu.MAX_TOOL_OUTPUT_CHARS + 1_000
+    assert "characters omitted by the proxy" in transcript
+    assert "MIDDLE" not in transcript
+    assert transcript.rstrip().endswith("Z")
+
+
+def test_small_tool_result_is_not_clipped():
+    _, transcript = toolemu.render_transcript([
+        {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "a.txt"},
+    ])
+    assert "characters omitted" not in transcript
+    assert "[tool result: shell (call_id=c1)]\na.txt" in transcript
+
+
+def test_responses_usage_includes_token_details(make_client):
+    # JetBrains' koog client rejects a usage object without the *_details fields.
+    client, _ = make_client('<tool_call name="shell">\n{"command": ["dir"]}\n</tool_call>')
+    usage = client.post("/responses", json={"input": "list", "tools": [SHELL_TOOL]}).json()["usage"]
+    assert usage["input_tokens_details"] == {"cached_tokens": 0}
+    assert usage["output_tokens_details"] == {"reasoning_tokens": 0}
+
+
+def test_orchestration_upstream_error_returns_502(make_client):
+    import httpx
+
+    client, fake = make_client("")
+
+    async def boom(**_):
+        raise httpx.ConnectError("down")
+
+    fake.execute = boom
+    resp = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "Suggest a most specific title for this chat"}]})
+    assert resp.status_code == 502
+    assert "down" in resp.json()["error"]["message"]
+
+
+def test_urls_are_defanged_for_safegpt_and_restored_in_replies():
+    from app.safegpt_client import defang_urls, restore_urls
+
+    text = 'url = "https://pypi.org/simple"\nsee http://x.io and file:///C:/a; ratio 1:2, C:/Projects'
+    out = defang_urls(text)
+    assert "://" not in out
+    assert "ratio 1:2, C:/Projects" in out
+    assert restore_urls(out) == text
+
+
+def test_transcript_over_limit_drops_oldest_turns_but_keeps_task():
+    turns = ["[user]\ntask"] + [f"[tool result: t{i}]\n" + "x" * 100 for i in range(10)]
+    fitted = toolemu.fit_turns(turns, limit=500)
+    assert fitted[0] == "[user]\ntask"
+    assert "earlier turns omitted" in fitted[1]
+    assert fitted[-1] == turns[-1]
+    assert sum(len(t) + 2 for t in fitted) < 700
+    assert toolemu.fit_turns(turns[:2], limit=500) == turns[:2]
+
+
+def test_chat_stream_sends_role_chunk_and_keepalives_before_reply(make_client, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(router_module, "KEEPALIVE_SECONDS", 0.01)
+    client, fake = make_client("")
+
+    async def slow(system_message, prompt, model):
+        await asyncio.sleep(0.05)
+        return '<tool_call name="run_commands">\n{"commands": ["dir"]}\n</tool_call>'
+
+    fake.execute = slow
+    text = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "list"}], "tools": [CLINE_RUN_COMMANDS], "stream": True,
+    }).text
+    assert text.startswith("data: ") and ": keep-alive\n\n" in text
+    chunks = sse_events(text)
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert sum(1 for c in chunks if c["choices"][0]["delta"].get("role")) == 1
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert text.strip().endswith("data: [DONE]")
+
+
+def test_chat_stream_reports_upstream_error(make_client):
+    import httpx
+
+    client, fake = make_client("")
+
+    async def boom(**_):
+        raise httpx.ConnectError("down")
+
+    fake.execute = boom
+    text = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "x"}], "tools": [CLINE_RUN_COMMANDS], "stream": True}).text
+    events = sse_events(text)
+    assert events[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert "down" in events[-1]["error"]["message"]
+    assert text.strip().endswith("data: [DONE]")
+
+
 def test_empty_reply_is_retried(make_client):
     client, fake = make_client("", followup_reply='<tool_call name="shell">\n{"command": ["dir"]}\n</tool_call>')
     out = client.post("/responses", json={"input": "edit the readme", "tools": [SHELL_TOOL]}).json()["output"]

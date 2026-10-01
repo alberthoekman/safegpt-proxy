@@ -108,6 +108,18 @@ SafeGPT returns:
 - `conversationId`
 - metadata such as `conversationName`, timestamps, `messages`, and token counters
 
+### Message/Execute (orchestration calls)
+`POST /v1/Message/Execute` is stateless:
+```json
+{
+  "systemMessage": "...",
+  "prompt": "..."
+}
+```
+SafeGPT returns `{"content": "..."}`. No model, conversation id, or `chatAppIds` are sent.
+
+**Known issue:** SafeGPT fetches every `scheme://` URL in a prompt or system message and inlines the page before checking its 10,485,760-char limit, so a small request can fail with `string_above_max_length` and a huge reported length. `SafeGPTClient` defangs URLs in every outgoing prompt (`defang_urls()`, a word joiner after the scheme colon) and strips the joiner from replies (`restore_urls()`). Do not remove this.
+
 ### Message creation
 SafeGPT message creation can be called with:
 ```json
