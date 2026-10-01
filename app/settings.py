@@ -10,7 +10,7 @@ class Settings(BaseModel):
     port: int = 8000
     safegpt_base_url: str = "https://api.safegpt.nl"
     safegpt_token: str = ""
-    default_model_id: str = "gpt-5.6-sol"
+    default_model_id: str = "gpt-5.6-terra"
     web_search_chat_app_id: str = "48c7ce55-6208-4036-b6bb-69a0a1ab2b31"
     code_interpreter_chat_app_id: str = "25144c6e-8e6d-4fb4-97c6-32ef2385c08d"
 

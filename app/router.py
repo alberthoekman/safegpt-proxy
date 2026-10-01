@@ -16,8 +16,14 @@ from app.models import (
     chat_completion_response,
     models_list,
     responses_object,
+    responses_usage,
 )
-from app.safegpt_client import SafeGPTClient, iter_safegpt_sse_lines, parse_safegpt_data
+from app.safegpt_client import (
+    SafeGPTClient,
+    SafeGPTStuckExecuteError,
+    iter_safegpt_sse_lines,
+    parse_safegpt_data,
+)
 from app.session import cleanup_sessions, get_or_create_session, load_response, store_response
 
 router = APIRouter()
@@ -191,7 +197,7 @@ async def stream_responses_events(text_chunks, model: str, include_usage: bool =
         "output_index": 0,
         "item": final_item,
     })
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0} if include_usage else None
+    usage = responses_usage() if include_usage else None
     yield event("response.completed", {
         "response": responses_envelope(model, response_id, "completed", output=[final_item], usage=usage),
     })
@@ -270,8 +276,49 @@ KEEPALIVE_SECONDS = 10
 MAX_NUDGES = 2
 # Resends of the identical SafeGPT request when it comes back empty.
 EMPTY_RETRIES = 2
+# SafeGPT's Message/Execute rejects requests above 10485760 chars (string_above_max_length);
+# stay well under that so truncation math (system message + marker) can't push us back over.
+SAFEGPT_MAX_PROMPT_CHARS = 9_000_000
+
+def truncate_prompt_for_safegpt(system_message: str, prompt: str, limit: int = SAFEGPT_MAX_PROMPT_CHARS) -> str:
+    """Keep the most recent whole turns of `prompt` within SafeGPT's size limit.
+
+    Agentic clients like Cline resend the full transcript, including verbose past tool
+    output (e.g. whole-directory listings), every turn. Left unchecked this eventually
+    exceeds SafeGPT's max request size and every call fails identically until the client
+    gives up retrying. build_prompts()/render_transcript() join turns with "\n\n", so
+    truncating on that same separator drops whole turns instead of slicing through a
+    <tool_call> tag or a tool-result block, which would confuse the model.
+    """
+    budget = limit - len(system_message)
+    if budget <= 0 or len(prompt) <= budget:
+        return prompt
+    marker = "[... earlier conversation truncated to fit SafeGPT's request size limit ...]"
+    segments = prompt.split("\n\n")
+    kept: List[str] = []
+    remaining = budget - len(marker)
+    for segment in reversed(segments):
+        cost = len(segment) + 2  # + the "\n\n" that will join it to its neighbor
+        if cost > remaining:
+            break
+        kept.insert(0, segment)
+        remaining -= cost
+    if not kept:
+        # Not even the single most recent turn fits; fall back to a raw tail slice of it.
+        tail_budget = max(budget - len(marker) - 2, 0)
+        return f"{marker}\n\n{segments[-1][-tail_budget:]}" if tail_budget else prompt[-budget:]
+    return marker + "\n\n" + "\n\n".join(kept)
 
 def describe_upstream_error(exc: Exception) -> str:
+    if isinstance(exc, SafeGPTStuckExecuteError):
+        detail = (
+            "SafeGPT's Message/Execute endpoint hit a known stuck-connection state "
+            f"({exc}). This is not caused by this request's size — retrying with a "
+            "smaller prompt will not help. See claude.md's 'Message/Execute' known-issue "
+            "note; the proxy is short-circuiting further calls until its next self-probe."
+        )
+        logger.error(detail)
+        return detail
     detail = str(exc) or type(exc).__name__
     if isinstance(exc, httpx.HTTPStatusError):
         detail = f"SafeGPT returned {exc.response.status_code}: {exc.response.text[:2000]}"
@@ -280,7 +327,8 @@ def describe_upstream_error(exc: Exception) -> str:
 
 def upstream_error(exc: Exception) -> JSONResponse:
     detail = describe_upstream_error(exc)
-    return JSONResponse(status_code=502, content={"error": {"message": detail, "type": "upstream_error", "code": "safegpt_error"}})
+    code = "safegpt_execute_stuck" if isinstance(exc, SafeGPTStuckExecuteError) else "safegpt_error"
+    return JSONResponse(status_code=502, content={"error": {"message": detail, "type": "upstream_error", "code": code}})
 
 async def stream_response_items(produce, model: str, response_id: str, on_complete=None):
     """Emit Responses-API SSE events; `produce()` returns the complete output items."""
@@ -339,7 +387,7 @@ async def stream_response_items(produce, model: str, response_id: str, on_comple
         else:
             yield event("response.output_item.added", {"output_index": idx, "item": {**item, "status": "in_progress"}})
         yield event("response.output_item.done", {"output_index": idx, "item": item})
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    usage = responses_usage()
     yield event("response.completed", {"response": responses_envelope(model, response_id, "completed", output=items, usage=usage)})
 
 def chat_message_from_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -408,7 +456,12 @@ async def handle_tool_request(body: Dict[str, Any], is_responses: bool):
         # SafeGPT intermittently returns an empty reply, much more often for long outputs
         # such as whole-file rewrites. It fails fast, so first resend the identical request;
         # on the last retry ask for a shorter reply instead.
-        request = prompt_text
+        request = truncate_prompt_for_safegpt(system_message, prompt_text)
+        if len(request) < len(prompt_text):
+            logger.warning(
+                "%s prompt exceeded SafeGPT's size limit (%d chars); truncated to %d chars by dropping oldest turns",
+                label, len(prompt_text), len(request),
+            )
         for attempt in range(EMPTY_RETRIES + 1):
             reply_text = await safegpt_client.execute(system_message=system_message, prompt=request, model=model)
             logger.info("SafeGPT %s: %s", label, reply_text)
@@ -416,7 +469,8 @@ async def handle_tool_request(body: Dict[str, Any], is_responses: bool):
                 break
             shorten = attempt + 1 == EMPTY_RETRIES
             logger.info("Empty SafeGPT reply; retry %d%s", attempt + 1, " asking for a shorter reply" if shorten else " with the same request")
-            request = toolemu.shorter_reply_prompt(prompt_text) if shorten else prompt_text
+            next_request = toolemu.shorter_reply_prompt(prompt_text) if shorten else prompt_text
+            request = truncate_prompt_for_safegpt(system_message, next_request)
         return reply_text
 
     user_request = toolemu.last_user_request(items)
@@ -451,7 +505,7 @@ async def handle_tool_request(body: Dict[str, Any], is_responses: bool):
 
     try:
         output = await produce()
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, SafeGPTStuckExecuteError) as exc:
         return upstream_error(exc)
 
     if not is_responses:
@@ -465,7 +519,7 @@ async def handle_tool_request(body: Dict[str, Any], is_responses: bool):
 
     response_id = f"resp_{uuid.uuid4().hex}"
     store_response(response_id, items + output)
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    usage = responses_usage()
     response = responses_envelope(model, response_id, "completed", output=output, usage=usage)
     response["output_text"] = "\n".join(i["content"][0]["text"] for i in output if i["type"] == "message")
     return JSONResponse(response)
@@ -479,7 +533,8 @@ def get_models():
 @router.get("/healthz")
 @router.get("/v1/healthz")
 def healthz_root():
-    return {"ok": True}
+    status = safegpt_client.execute_breaker_status() if safegpt_client else "unknown"
+    return {"ok": True, "safegpt_execute_breaker": status}
 
 @router.post("/v1/responses")
 @router.post("/responses")
@@ -507,11 +562,14 @@ async def chat_completions(request: Request):
     state.touch()
 
     if should_use_execute(body):
-        content = await safegpt_client.execute(
-            system_message=build_execute_system_message(body),
-            prompt=build_execute_prompt(body),
-            model=model,
-        )
+        try:
+            content = await safegpt_client.execute(
+                system_message=build_execute_system_message(body),
+                prompt=build_execute_prompt(body),
+                model=model,
+            )
+        except (httpx.HTTPError, SafeGPTStuckExecuteError) as exc:
+            return upstream_error(exc)
         if stream:
             if is_responses:
                 return StreamingResponse(

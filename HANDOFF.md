@@ -33,12 +33,84 @@ The user must use SafeGPT (https://api.safegpt.nl) and wants coding agents (firs
 - Cline plan/act loop works end to end: tools run and results come back.
 - Latest replay of "update the readme: add 'moi' at the top", after reading the file: **4 of 5 runs produced a valid in-place `apply_patch` Update**. In 1 run the model wrote "I'll prepend `moi`… then verify" and still answered `FINAL` to the follow-up.
 
+## Known SafeGPT quirks
+
+- **`Message/Execute` intermittent fixed-oversized-error bug (found 2026-09-29,
+  mitigated, root cause NOT fully confirmed):** SafeGPT sometimes rejects an Execute call
+  with a fixed, fabricated `string_above_max_length` error (reports `12,912,575` chars
+  every time) regardless of actual request size (measured 57,770–~64,000 bytes).
+  Investigation history, in order:
+  1. Reproduced identically after swapping to a different SafeGPT API key (not
+     token-scoped) and even on a brand-new `httpx.AsyncClient` with connection reuse
+     disabled — ruled out a connection-reuse/keep-alive desync (first theory, wrong).
+  2. An equivalent request sent directly via Postman succeeded immediately, pointing at
+     `SafeGPTClient.headers()` sending `Accept: application/json, text/event-stream` on
+     every call including `Message/Execute` (which never streams) — fixed by narrowing
+     the default `Accept` to `application/json` (second theory).
+  3. A live bisection after that fix — reconstructing a real failing request with
+     near-exact fidelity (system message within 60 chars of the real 14,455; a realistic
+     multi-turn prompt) via a scratch script hitting `SafeGPTClient` directly — succeeded
+     every time across 9 separate live calls. So it does **not** reproduce
+     deterministically from content, size, or the `Accept` header. (Working theory at
+     this point: intermittent/probabilistic on SafeGPT's side. **Superseded, see #4.**)
+  4. **Later the same day**, a further live test disproved #3's theory too: three
+     sequential, non-identical, fresh-client requests replayed directly against
+     `SafeGPTClient` — a ~19.4KB reconstruction failed twice in a row (including with a
+     random nonce appended on a brand-new client, ruling out content-hash caching), while
+     the same system message with an ~8.5KB and ~12.5KB prompt both succeeded. A real,
+     size-correlated threshold between ~12.5–19.4KB, **far below** the ~31–32KB payloads
+     that succeeded 9/9 times earlier that same day — the threshold appears to shrink
+     over time. Much more consistent with a **rolling usage quota** (chars/tokens per
+     hour or day on this API key/account) than random per-attempt bad luck, especially
+     since every retry is itself a real call that could burn more of the same budget.
+  5. A full codebase dive (assuming the bug was ours) then checked every file in the
+     request path — `app/safegpt_client.py`, `app/router.py`, `app/tools.py`,
+     `app/session.py`, `app/settings.py`, `main.py` — plus `httpx` 0.28.1's actual wire
+     encoding (read directly from the installed package: `ensure_ascii=False,
+     separators=(",", ":")`, matching our own size logging almost exactly, if anything
+     slightly conservative). **Found no bug that explains the mismatch**: no unbounded
+     transcript growth, no duplication in `app/session.py`'s response store (and that
+     store only affects the `previous_response_id` path anyway, unused by Cline's Chat
+     Completions requests), no config/file-inclusion issue in `app/settings.py`. One real
+     (if unproven-as-root-cause) bug *was* found and fixed: `SafeGPTClient` held a shared,
+     unsynchronized `httpx.AsyncClient` that self-heal retries closed and replaced with no
+     lock — a latent race under concurrent proxy requests, with zero upside since
+     keep-alive was already disabled. Every call now opens/closes its own client via
+     `_new_client()`; see `app/safegpt_client.py`.
+  6. Worth keeping on record: the error's shape — `invalid_request_error`, path
+     `input[0].content[1].text`, limit `10485760` (exactly 10 MiB) — matches OpenAI's own
+     documented Responses API per-field limit and error format, not anything SafeGPT
+     documents. Consistent with `Message/Execute` being a thin relay in front of real
+     OpenAI, where SafeGPT assembles `input[0]` itself — the bloat likely happens after
+     our request leaves this process. Not proof, but the only theory that fits every data
+     point gathered.
+  Not fixable by trimming prompts (the existing size guards stay, for a separate reason).
+  **Current mitigation** in `app/safegpt_client.py`: `_execute_with_self_heal()` retries
+  up to `SELF_HEAL_MAX_ATTEMPTS = 2` (lowered from 3 — evidence in #4 showed extra retries
+  don't change the outcome against what looks like a real, active upstream constraint;
+  one retry still absorbs a genuinely transient blip). Only if all attempts fail does it
+  raise `SafeGPTStuckExecuteError` and open a circuit breaker with a **short** cooldown
+  (`BREAKER_BASE_COOLDOWN_SECONDS = 10`, capped `BREAKER_MAX_COOLDOWN_SECONDS = 120`). The
+  `Accept` header fix and disabled connection reuse (now: no shared client at all — see
+  #5) are kept as harmless, plausible contributing fixes. May be the same underlying
+  mechanism as the "intermittent empty reply" quirk below.
+  Check current status any time with `python scripts/diagnose_safegpt.py` (bypasses the
+  whole proxy) or `GET /healthz` (`safegpt_execute_breaker` field). Given #4–#6, the
+  recommended next step if this recurs is a SafeGPT support ticket (cite the OpenAI-limit
+  number and the shrinking-threshold evidence), not another proxy-side size guess.
+- **Intermittent empty replies:** see item 8 in "How the emulation works" above — SafeGPT
+  sometimes returns `{"content":""}` fast, more often for long outputs. Already handled by
+  resend-then-shorten retries.
+
 ## Open issues / next steps
 
 1. **Wrong `FINAL` answers remain (~1 in 5).** Idea: if the draft reads as future intent ("I'll", "I need to", "Plan:", "next") and the follow-up says FINAL, ask once more, or ignore FINAL in that case. Keep it simple and test live.
 2. **Unanswered first request** in the user's last log (`pasted-text-4`): the first `/v1/chat/completions` logged "Emitting output items" but no `200 OK` access line, and Cline then sent "[TASK RESUMPTION]". This was not yet asked: did the user cancel, or did Cline time out or error? For Chat Completions streaming, the proxy computes the whole reply **before** starting the stream (no keep-alive, unlike the Responses path). If Cline has a first-byte timeout, move chat streaming to the same pattern as `stream_response_items` (send the role chunk immediately, then keep-alives, then the content).
 3. **Latency:** retries and follow-ups can mean several SafeGPT calls (~2 s each, up to ~10–20 s per step) with nothing shown in Cline meanwhile.
-4. Nothing is committed yet; ask the user before committing.
+4. Nothing is committed yet; ask the user before committing. This now includes the
+   `Message/Execute` connection-reuse fix: `app/safegpt_client.py`, `app/router.py`,
+   `scripts/diagnose_safegpt.py` (new), `tests/test_safegpt_client_breaker.py` (new),
+   `claude.md`, and this file.
 
 ## How to debug with the user
 

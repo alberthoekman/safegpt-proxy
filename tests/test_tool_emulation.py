@@ -87,6 +87,47 @@ def test_transcript_renders_previous_calls_and_results():
     assert "xyz" not in transcript
 
 
+def test_transcript_caps_oversized_tool_output():
+    """A single huge tool result (e.g. a recursive directory listing) must not dominate
+    every subsequent turn once the client resends the full transcript verbatim each time."""
+    huge = "line-start\n" + ("x" * 20000) + "\nline-end"
+    _, transcript = toolemu.render_transcript([
+        {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": huge},
+    ])
+    assert len(transcript) < len(huge)
+    assert "chars omitted" in transcript
+    assert "line-start" in transcript  # head preserved
+    assert "line-end" in transcript  # tail preserved
+
+
+def test_transcript_leaves_small_tool_output_untouched():
+    _, transcript = toolemu.render_transcript([
+        {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "a.txt"},
+    ])
+    assert "chars omitted" not in transcript
+    assert "[tool result: shell (call_id=c1)]\na.txt" in transcript
+
+
+def test_truncate_prompt_for_safegpt_noop_when_within_budget():
+    assert router_module.truncate_prompt_for_safegpt("sys", "short prompt") == "short prompt"
+
+
+def test_truncate_prompt_for_safegpt_drops_whole_oldest_turns():
+    turns = [f"[user]\nturn {i} " + ("x" * 50) for i in range(20)]
+    prompt = "\n\n".join(turns)
+    truncated = router_module.truncate_prompt_for_safegpt("sys", prompt, limit=len("sys") + 300)
+
+    assert len(truncated) <= 300
+    assert "truncated to fit SafeGPT's request size limit" in truncated
+    assert "turn 19" in truncated  # most recent turn kept
+    assert "turn 0 " not in truncated  # oldest turn dropped
+    # every kept turn is whole, never a mid-tag/mid-block slice
+    for segment in truncated.split("\n\n")[1:]:
+        assert segment.startswith("[user]\nturn ")
+
+
 def test_responses_function_and_custom_calls_streamed(make_client):
     client, fake = make_client(
         'Checking.\n<tool_call name="shell">\n{"command": ["ls", "-la"]}\n</tool_call>\n'

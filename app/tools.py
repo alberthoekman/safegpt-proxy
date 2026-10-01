@@ -376,6 +376,26 @@ def _render_call(name: str, body: str) -> str:
     return f'<tool_call name="{name}">\n{body}\n</tool_call>'
 
 
+# Agentic clients (Cline, Codex, ...) resend the full transcript every turn, so a single
+# oversized tool result (e.g. a recursive directory listing) gets embedded verbatim again
+# and again for the rest of the session until it alone can push the request over SafeGPT's
+# size limit. Cap each rendered tool-result block instead of letting it compound unbounded.
+TOOL_OUTPUT_CHAR_LIMIT = 6000
+
+
+def _truncate_tool_output(text: str, limit: int = TOOL_OUTPUT_CHAR_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    logger.info("Truncating oversized tool result: %d chars -> ~%d chars", len(text), limit)
+    marker = f"\n... [{len(text) - limit} chars omitted] ...\n"
+    budget = limit - len(marker)
+    if budget <= 0:
+        return text[:limit]
+    head = budget * 2 // 3
+    tail = budget - head
+    return text[:head] + marker + (text[-tail:] if tail > 0 else "")
+
+
 def _qualified(item: Dict[str, Any]) -> str:
     ns = item.get("namespace")
     return f"{ns}.{item.get('name', '')}" if ns and ns != DEFAULT_NAMESPACE else item.get("name", "")
@@ -442,10 +462,12 @@ def render_transcript(items: List[Dict[str, Any]], wrap_params: Optional[Dict[st
                 output = f"status: {item.get('status', '')}\n{item.get('output') or ''}".strip()
             else:
                 output = content_to_text(output)
+            output = _truncate_tool_output(output)
             turns.append(f"[tool result: {call_names.get(call_id, 'tool')} (call_id={call_id})]\n{output}")
         elif itype == "local_shell_call_output":
             call_id = item.get("call_id") or item.get("id", "")
-            turns.append(f"[tool result: local_shell (call_id={call_id})]\n{content_to_text(item.get('output'))}")
+            output = _truncate_tool_output(content_to_text(item.get("output")))
+            turns.append(f"[tool result: local_shell (call_id={call_id})]\n{output}")
         elif itype in ("reasoning", "additional_tools"):
             # Encrypted reasoning is meaningless to SafeGPT; tools go into the system message.
             continue

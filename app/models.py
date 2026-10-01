@@ -61,6 +61,18 @@ def chat_completion_chunk(model: str, chunk_id: str, created: int, content_delta
         chunk["usage"] = usage
     return chunk
 
+def responses_usage(input_tokens: int = 0, output_tokens: int = 0):
+    # Some Responses API clients (e.g. JetBrains AI Assistant's koog library) deserialize
+    # this strictly and reject a usage object missing input_tokens_details/
+    # output_tokens_details, even though we don't track real token counts yet.
+    return {
+        "input_tokens": input_tokens,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": output_tokens,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": input_tokens + output_tokens,
+    }
+
 def responses_output_item(item_id: str, text: str, status: str = "completed"):
     return {
         "id": item_id,
@@ -84,5 +96,5 @@ def responses_object(model: str, response_id: str, text: str, item_id: str = Non
         "output_text": text,
         "parallel_tool_calls": False,
         "text": {"format": {"type": "text"}},
-        "usage": usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        "usage": usage or responses_usage(),
     }
